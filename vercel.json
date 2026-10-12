@@ -1,0 +1,1 @@
+{"buildCommand":"npm run build","framework":null,"outputDirectory":"dist","rewrites":[{"destination":"/api/actions","source":"/actions"}]}

@@ -49,7 +49,29 @@ Log in with the admin username and password configured on the server:
 Login sessions are random tokens stored server-side with a 7-day
 expiry; the browser keeps the token in localStorage.
 
+## Deploy via git — Vercel (supported, with a storage caveat)
+
+This repo includes a `vercel.json` and an `api/actions.mjs` serverless
+function, so a plain Vercel import of the repo works:
+
+1. Push this folder to a GitHub repository.
+2. In Vercel: **Add New → Project**, import the repo. Do not change the
+   build settings — `vercel.json` already sets the build command
+   (`npm run build`), the output directory (`dist`), and a rewrite from
+   `/actions` to the serverless function.
+3. Optionally set `ADMIN_USERNAME` / `ADMIN_PASSWORD` in the Vercel
+   project's Environment Variables.
+
+**Caveat:** Vercel functions have no durable disk. The SQLite store
+lives in `/tmp`, so the site always displays correctly (it re-seeds
+with the shop's data on cold starts), but admin edits and login
+sessions can reset between cold starts and redeploys. If you need the
+admin panel's edits to stick permanently, deploy on Render instead
+(next section) with a persistent disk.
+
 ## Deploy via git — Render (recommended)
+
+
 
 This repo includes a `Dockerfile` and a `render.yaml` Blueprint.
 

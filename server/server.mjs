@@ -43,7 +43,11 @@ const SESSION_ERROR = "Your session has expired. Please log in again.";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = join(__dirname, "..", "dist");
 const DATA_FILE =
-  process.env.DATA_FILE || join(__dirname, "data", "app.db");
+  process.env.DATA_FILE ||
+  // On Vercel the project filesystem is read-only; the only writable
+  // location is /tmp (per-instance, so the store re-seeds on cold starts
+  // and admin edits are not durable there — see README).
+  (process.env.VERCEL ? "/tmp/nextgen-app.db" : join(__dirname, "data", "app.db"));
 
 // ---------------------------------------------------------------------------
 // Store
@@ -247,7 +251,7 @@ const sortOrderOf = (v) =>
 // Actions (same names and response shapes as the original)
 // ---------------------------------------------------------------------------
 
-const Actions = {
+export const Actions = {
   getSiteData() {
     return { settings: readSettings(), ...loadCollections(true) };
   },
@@ -577,6 +581,11 @@ const server = createServer((req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[nextgen] listening on http://0.0.0.0:${PORT}`);
-});
+// Only listen when run directly (`node server/server.mjs`). The Vercel
+// serverless function (api/actions.mjs) imports { Actions } from this
+// module and must not start an HTTP server.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`[nextgen] listening on http://0.0.0.0:${PORT}`);
+  });
+}
