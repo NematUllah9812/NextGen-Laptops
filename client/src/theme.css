@@ -1,0 +1,166 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+
+  /* Apple-like system stack: SF Pro on Apple devices, Inter elsewhere. */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+    "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+:root {
+  color-scheme: light;
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --surface-alt: #f5f5f7;
+  --text: #1d1d1f;
+  --dim: #6e6e73;
+  --border: #d2d2d7;
+  --accent: #0066cc;
+  --accent-ink: #ffffff;
+  --wa: #3d9970;
+  --danger: #d70015;
+  --radius: 20px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-alt);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+  /* Soft, layered shadows — light mode */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.07);
+  --shadow-card-hover: 0 2px 4px rgba(0, 0, 0, 0.05), 0 20px 44px rgba(0, 0, 0, 0.12);
+  --shadow-header: 0 1px 14px rgba(0, 0, 0, 0.05);
+  --shadow-pop: 0 10px 30px rgba(0, 0, 0, 0.16);
+  --card-ring: rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #000000;
+    --surface: #1c1c1e;
+    --surface-alt: #2c2c2e;
+    --text: #f5f5f7;
+    --dim: #a1a1a6;
+    --border: #38383a;
+    --accent: #2997ff;
+    --accent-ink: #ffffff;
+    --wa: #4cc38a;
+    --danger: #ff6961;
+    /* Dark mode needs deeper shadows + a hairline ring to separate
+       near-black cards from the black page behind them. */
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.5);
+    --shadow-card-hover: 0 2px 4px rgba(0, 0, 0, 0.55), 0 22px 48px rgba(0, 0, 0, 0.65);
+    --shadow-header: 0 1px 14px rgba(0, 0, 0, 0.55);
+    --shadow-pop: 0 12px 34px rgba(0, 0, 0, 0.65);
+    --card-ring: rgba(255, 255, 255, 0.08);
+  }
+}
+
+/* Deal cards: hairline ring + soft shadow, gentle lift on hover. */
+.deal-card {
+  border: 1px solid var(--card-ring);
+  box-shadow: var(--shadow-card);
+  transition:
+    transform 0.35s ease,
+    box-shadow 0.35s ease;
+}
+.deal-card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-card-hover);
+}
+
+/* Transparent laptop cutouts: a wide soft drop shadow plus a tighter
+   contact shadow so the machine sits on the surface instead of floating.
+   Dark mode gets a deeper shadow — on near-black surfaces a light one
+   would vanish. */
+.laptop-img {
+  filter:
+    drop-shadow(0 16px 18px rgba(0, 0, 0, 0.16))
+    drop-shadow(0 3px 5px rgba(0, 0, 0, 0.12));
+}
+.hero-laptop {
+  filter:
+    drop-shadow(0 34px 34px rgba(0, 0, 0, 0.2))
+    drop-shadow(0 7px 12px rgba(0, 0, 0, 0.12));
+}
+@media (prefers-color-scheme: dark) {
+  .laptop-img {
+    filter:
+      drop-shadow(0 18px 22px rgba(0, 0, 0, 0.6))
+      drop-shadow(0 4px 7px rgba(0, 0, 0, 0.55));
+  }
+  .hero-laptop {
+    filter:
+      drop-shadow(0 38px 40px rgba(0, 0, 0, 0.7))
+      drop-shadow(0 8px 14px rgba(0, 0, 0, 0.6));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deal-card {
+    transition: none;
+  }
+  .deal-card:hover {
+    transform: none;
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* One gentle fade-up as the hero first appears. Nothing else animates. */
+@keyframes hero-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.hero-in {
+  animation: hero-in 0.9s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .hero-in {
+    animation: none;
+  }
+}

@@ -1,0 +1,22 @@
+# Render Blueprint — deploy with "New > Blueprint" pointing at this repo,
+# or create a Web Service manually with the same settings.
+services:
+  - type: web
+    name: nextgen-laptops
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      # Set the real admin credentials in the Render dashboard instead of
+      # committing them. If unset, the server falls back to its built-in
+      # defaults — change them here before going live.
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      # Optional: point DATA_FILE at a Render persistent disk mount
+      # (e.g. /var/data/app.db) so shop data and admin edits survive
+      # deploys. Without a disk, the store is re-seeded on each deploy.
+      - key: DATA_FILE
+        sync: false
