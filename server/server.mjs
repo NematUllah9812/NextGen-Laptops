@@ -2,7 +2,9 @@
 //
 // A dependency-light port of the original artifact's server actions:
 //   - plain node:http (no framework)
-//   - node:sqlite (built into Node 22+) for storage
+//   - storage through the async libSQL facade in ./db.mjs — a hosted
+//     Turso database when TURSO_DATABASE_URL is set, otherwise a local
+//     SQLite file; see db.mjs and the README
 //   - serves the built client from ../dist
 //   - POST /actions with a JSON body { action, args } dispatches to the
 //     same action names and response shapes as the original:
@@ -11,17 +13,19 @@
 //     saveDeal/deleteDeal, saveService/deleteService,
 //     saveTestimonial/deleteTestimonial, saveFaq/deleteFaq
 //
-// Data file: DATA_FILE env var, or ./data/app.db next to this file.
-// Seeding happens automatically at startup when the store is empty and
-// never overwrites admin edits.
+// Startup: initDb() creates the tables and seeds the shop data when
+// the store is empty (never overwriting admin edits). When this file
+// is run directly it seeds before listening; the Vercel function
+// (api/actions.mjs) instead awaits initDb() lazily on first request —
+// initDb() is idempotent and caches its promise, so both are safe.
 
 import { createServer } from "node:http";
-import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { db, dbLocation } from "./db.mjs";
 import {
   SETTING_KEYS,
   SETTING_KEY_SET,
@@ -42,20 +46,12 @@ const SESSION_ERROR = "Your session has expired. Please log in again.";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = join(__dirname, "..", "dist");
-const DATA_FILE =
-  process.env.DATA_FILE ||
-  // On Vercel the project filesystem is read-only; the only writable
-  // location is /tmp (per-instance, so the store re-seeds on cold starts
-  // and admin edits are not durable there — see README).
-  (process.env.VERCEL ? "/tmp/nextgen-app.db" : join(__dirname, "data", "app.db"));
 
 // ---------------------------------------------------------------------------
-// Store
+// Store: schema + seeding
 // ---------------------------------------------------------------------------
 
-mkdirSync(dirname(DATA_FILE), { recursive: true });
-const db = new DatabaseSync(DATA_FILE);
-db.exec(`
+const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS site_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -103,14 +99,73 @@ db.exec(`
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
-`);
+`;
+
+async function seedIfEmpty() {
+  const dealCount = (await db.get("SELECT COUNT(*) AS n FROM deals")).n;
+  const settingsCount = (
+    await db.get("SELECT COUNT(*) AS n FROM site_settings")
+  ).n;
+  if (dealCount > 0 || settingsCount > 0) return false;
+  const now = Date.now();
+  const statements = [];
+  for (const [key, value] of Object.entries(SEED_SETTINGS)) {
+    statements.push(["INSERT INTO site_settings (key, value) VALUES (?, ?)", [key, value]]);
+  }
+  for (const d of SEED_DEALS) {
+    statements.push([
+      `INSERT INTO deals (title, brand, processor, ram, storage, display,
+         condition, battery_note, image_url, price, badge, featured, active,
+         sort_order, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        d.title, d.brand, d.processor, d.ram, d.storage, d.display,
+        d.condition, d.batteryNote, d.imageUrl, d.price, d.badge,
+        d.featured, d.active, d.sortOrder, now,
+      ],
+    ]);
+  }
+  for (const sv of SEED_SERVICES) {
+    statements.push([
+      "INSERT INTO services (title, description, sort_order) VALUES (?, ?, ?)",
+      [sv.title, sv.description, sv.sortOrder],
+    ]);
+  }
+  for (const t of SEED_TESTIMONIALS) {
+    statements.push([
+      "INSERT INTO testimonials (name, role, body, rating, sort_order) VALUES (?, ?, ?, ?, ?)",
+      [t.name, t.role, t.body, t.rating, t.sortOrder],
+    ]);
+  }
+  for (const f of SEED_FAQS) {
+    statements.push([
+      "INSERT INTO faqs (question, answer, sort_order) VALUES (?, ?, ?)",
+      [f.question, f.answer, f.sortOrder],
+    ]);
+  }
+  // One write transaction: either the whole seed lands or none of it.
+  await db.batch(statements);
+  return true;
+}
+
+// Create the tables and seed if empty. Idempotent; the in-flight
+// promise is cached so concurrent first requests share one init.
+// Resolves to whether seeding happened.
+let initPromise;
+export function initDb() {
+  initPromise ??= (async () => {
+    await db.exec(SCHEMA_SQL);
+    return seedIfEmpty();
+  })();
+  return initPromise;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers (same semantics as the original actions)
 // ---------------------------------------------------------------------------
 
-function readSettings() {
-  const rows = db.prepare("SELECT key, value FROM site_settings").all();
+async function readSettings() {
+  const rows = await db.all("SELECT key, value FROM site_settings");
   const out = { ...SEED_SETTINGS };
   for (const row of rows) out[row.key] = row.value;
   return out;
@@ -136,23 +191,21 @@ function mapDeal(row) {
   };
 }
 
-function loadCollections(activeDealsOnly) {
-  const dealRows = activeDealsOnly
-    ? db
-        .prepare(
-          "SELECT * FROM deals WHERE active = 1 ORDER BY sort_order ASC, id ASC",
-        )
-        .all()
-    : db.prepare("SELECT * FROM deals ORDER BY sort_order ASC, id ASC").all();
-  const serviceRows = db
-    .prepare("SELECT * FROM services ORDER BY sort_order ASC, id ASC")
-    .all();
-  const testimonialRows = db
-    .prepare("SELECT * FROM testimonials ORDER BY sort_order ASC, id ASC")
-    .all();
-  const faqRows = db
-    .prepare("SELECT * FROM faqs ORDER BY sort_order ASC, id ASC")
-    .all();
+async function loadCollections(activeDealsOnly) {
+  const dealRows = await db.all(
+    activeDealsOnly
+      ? "SELECT * FROM deals WHERE active = 1 ORDER BY sort_order ASC, id ASC"
+      : "SELECT * FROM deals ORDER BY sort_order ASC, id ASC",
+  );
+  const serviceRows = await db.all(
+    "SELECT * FROM services ORDER BY sort_order ASC, id ASC",
+  );
+  const testimonialRows = await db.all(
+    "SELECT * FROM testimonials ORDER BY sort_order ASC, id ASC",
+  );
+  const faqRows = await db.all(
+    "SELECT * FROM faqs ORDER BY sort_order ASC, id ASC",
+  );
   return {
     deals: dealRows.map(mapDeal),
     services: serviceRows.map((r) => ({
@@ -178,63 +231,16 @@ function loadCollections(activeDealsOnly) {
   };
 }
 
-function isAdmin(token) {
+async function isAdmin(token) {
   if (!token) return false;
-  const session = db
-    .prepare("SELECT * FROM admin_sessions WHERE token = ?")
-    .get(token);
+  const session = await db.get(
+    "SELECT * FROM admin_sessions WHERE token = ?",
+    [token],
+  );
   if (!session) return false;
   if (session.expires_at < Date.now()) {
-    db.prepare("DELETE FROM admin_sessions WHERE token = ?").run(token);
+    await db.run("DELETE FROM admin_sessions WHERE token = ?", [token]);
     return false;
-  }
-  return true;
-}
-
-function seedIfEmpty() {
-  const dealCount = db.prepare("SELECT COUNT(*) AS n FROM deals").get().n;
-  const settingsCount = db
-    .prepare("SELECT COUNT(*) AS n FROM site_settings")
-    .get().n;
-  if (dealCount > 0 || settingsCount > 0) return false;
-  const now = Date.now();
-  db.exec("BEGIN");
-  try {
-    const insSetting = db.prepare(
-      "INSERT INTO site_settings (key, value) VALUES (?, ?)",
-    );
-    for (const [key, value] of Object.entries(SEED_SETTINGS)) {
-      insSetting.run(key, value);
-    }
-    const insDeal = db.prepare(
-      `INSERT INTO deals (title, brand, processor, ram, storage, display,
-         condition, battery_note, image_url, price, badge, featured, active,
-         sort_order, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (const d of SEED_DEALS) {
-      insDeal.run(
-        d.title, d.brand, d.processor, d.ram, d.storage, d.display,
-        d.condition, d.batteryNote, d.imageUrl, d.price, d.badge,
-        d.featured, d.active, d.sortOrder, now,
-      );
-    }
-    const insService = db.prepare(
-      "INSERT INTO services (title, description, sort_order) VALUES (?, ?, ?)",
-    );
-    for (const sv of SEED_SERVICES) insService.run(sv.title, sv.description, sv.sortOrder);
-    const insTestimonial = db.prepare(
-      "INSERT INTO testimonials (name, role, body, rating, sort_order) VALUES (?, ?, ?, ?, ?)",
-    );
-    for (const t of SEED_TESTIMONIALS) insTestimonial.run(t.name, t.role, t.body, t.rating, t.sortOrder);
-    const insFaq = db.prepare(
-      "INSERT INTO faqs (question, answer, sort_order) VALUES (?, ?, ?)",
-    );
-    for (const f of SEED_FAQS) insFaq.run(f.question, f.answer, f.sortOrder);
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
   }
   return true;
 }
@@ -252,51 +258,51 @@ const sortOrderOf = (v) =>
 // ---------------------------------------------------------------------------
 
 export const Actions = {
-  getSiteData() {
-    return { settings: readSettings(), ...loadCollections(true) };
+  async getSiteData() {
+    return { settings: await readSettings(), ...(await loadCollections(true)) };
   },
 
-  seedInitialData() {
-    return { seeded: seedIfEmpty() };
+  async seedInitialData() {
+    return { seeded: await seedIfEmpty() };
   },
 
-  ensureDealImages() {
-    const rows = db.prepare("SELECT id, title, image_url FROM deals").all();
-    let updated = 0;
-    const upd = db.prepare("UPDATE deals SET image_url = ? WHERE id = ?");
+  async ensureDealImages() {
+    const rows = await db.all("SELECT id, title, image_url FROM deals");
+    const statements = [];
     for (const row of rows) {
       if (row.image_url.trim() !== "") continue;
       const known = KNOWN_DEAL_IMAGES.find((k) => row.title.includes(k.match));
       if (!known) continue;
-      upd.run(known.imageUrl, row.id);
-      updated += 1;
+      statements.push(["UPDATE deals SET image_url = ? WHERE id = ?", [known.imageUrl, row.id]]);
     }
-    return { updated };
+    if (statements.length > 0) await db.batch(statements);
+    return { updated: statements.length };
   },
 
-  adminLogin(args) {
+  async adminLogin(args) {
     if (args.username !== ADMIN_USERNAME || args.password !== ADMIN_PASSWORD) {
       return { ok: false, token: null, error: "Incorrect username or password." };
     }
     const token = `${randomUUID()}-${randomUUID()}`;
     const now = Date.now();
-    db.prepare(
+    await db.run(
       "INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?, ?, ?)",
-    ).run(token, now, now + SESSION_TTL_MS);
+      [token, now, now + SESSION_TTL_MS],
+    );
     return { ok: true, token, error: null };
   },
 
-  adminLogout(args) {
-    db.prepare("DELETE FROM admin_sessions WHERE token = ?").run(str(args.token, 500));
+  async adminLogout(args) {
+    await db.run("DELETE FROM admin_sessions WHERE token = ?", [str(args.token, 500)]);
     return { ok: true, error: null };
   },
 
-  checkSession(args) {
-    return { ok: isAdmin(str(args.token, 500)) };
+  async checkSession(args) {
+    return { ok: await isAdmin(str(args.token, 500)) };
   },
 
-  getAdminData(args) {
-    if (!isAdmin(str(args.token, 500))) {
+  async getAdminData(args) {
+    if (!(await isAdmin(str(args.token, 500)))) {
       return {
         ok: false,
         error: SESSION_ERROR,
@@ -307,11 +313,11 @@ export const Actions = {
         faqs: [],
       };
     }
-    return { ok: true, error: null, settings: readSettings(), ...loadCollections(false) };
+    return { ok: true, error: null, settings: await readSettings(), ...(await loadCollections(false)) };
   },
 
-  updateSettings(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR };
+  async updateSettings(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR };
     const values =
       args.values && typeof args.values === "object" ? args.values : {};
     const entries = Object.entries(values)
@@ -333,16 +339,18 @@ export const Actions = {
         return { ok: false, error: "That email address does not look right." };
       }
     }
-    const upsert = db.prepare(
-      `INSERT INTO site_settings (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    await db.batch(
+      entries.map(([key, value]) => [
+        `INSERT INTO site_settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        [key, value],
+      ]),
     );
-    for (const [key, value] of entries) upsert.run(key, value);
     return { ok: true, error: null };
   },
 
-  saveDeal(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR, id: null };
+  async saveDeal(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR, id: null };
     const title = reqStr(args.title, 200);
     if (!title) return { ok: false, error: "Title is required.", id: null };
     const so = sortOrderOf(args.sortOrder);
@@ -371,57 +379,60 @@ export const Actions = {
       so,
     ];
     if (args.id === null || args.id === undefined) {
-      const info = db
-        .prepare(
-          `INSERT INTO deals (title, brand, processor, ram, storage, display,
-             condition, battery_note, image_url, price, badge, featured,
-             active, sort_order, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(...values, Date.now());
+      const info = await db.run(
+        `INSERT INTO deals (title, brand, processor, ram, storage, display,
+           condition, battery_note, image_url, price, badge, featured,
+           active, sort_order, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [...values, Date.now()],
+      );
       return { ok: true, error: null, id: Number(info.lastInsertRowid) };
     }
-    db.prepare(
+    await db.run(
       `UPDATE deals SET title = ?, brand = ?, processor = ?, ram = ?,
          storage = ?, display = ?, condition = ?, battery_note = ?,
          image_url = ?, price = ?, badge = ?, featured = ?, active = ?,
          sort_order = ? WHERE id = ?`,
-    ).run(...values, args.id);
+      [...values, args.id],
+    );
     return { ok: true, error: null, id: args.id };
   },
 
-  deleteDeal(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR };
-    db.prepare("DELETE FROM deals WHERE id = ?").run(args.id);
+  async deleteDeal(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR };
+    await db.run("DELETE FROM deals WHERE id = ?", [args.id]);
     return { ok: true, error: null };
   },
 
-  saveService(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR, id: null };
+  async saveService(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR, id: null };
     const title = reqStr(args.title, 200);
     if (!title) return { ok: false, error: "Title is required.", id: null };
     const so = sortOrderOf(args.sortOrder);
     if (so === null) return { ok: false, error: "Sort order is out of range.", id: null };
     const description = str(args.description, 1000).trim();
     if (args.id === null || args.id === undefined) {
-      const info = db
-        .prepare("INSERT INTO services (title, description, sort_order) VALUES (?, ?, ?)")
-        .run(title, description, so);
+      const info = await db.run(
+        "INSERT INTO services (title, description, sort_order) VALUES (?, ?, ?)",
+        [title, description, so],
+      );
       return { ok: true, error: null, id: Number(info.lastInsertRowid) };
     }
-    db.prepare("UPDATE services SET title = ?, description = ?, sort_order = ? WHERE id = ?")
-      .run(title, description, so, args.id);
+    await db.run(
+      "UPDATE services SET title = ?, description = ?, sort_order = ? WHERE id = ?",
+      [title, description, so, args.id],
+    );
     return { ok: true, error: null, id: args.id };
   },
 
-  deleteService(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR };
-    db.prepare("DELETE FROM services WHERE id = ?").run(args.id);
+  async deleteService(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR };
+    await db.run("DELETE FROM services WHERE id = ?", [args.id]);
     return { ok: true, error: null };
   },
 
-  saveTestimonial(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR, id: null };
+  async saveTestimonial(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR, id: null };
     const name = reqStr(args.name, 120);
     const body = reqStr(args.body, 2000);
     if (!name) return { ok: false, error: "Name is required.", id: null };
@@ -437,24 +448,27 @@ export const Actions = {
     if (rating === undefined) return { ok: false, error: "Rating is out of range.", id: null };
     const role = str(args.role, 160).trim();
     if (args.id === null || args.id === undefined) {
-      const info = db
-        .prepare("INSERT INTO testimonials (name, role, body, rating, sort_order) VALUES (?, ?, ?, ?, ?)")
-        .run(name, role, body, rating, so);
+      const info = await db.run(
+        "INSERT INTO testimonials (name, role, body, rating, sort_order) VALUES (?, ?, ?, ?, ?)",
+        [name, role, body, rating, so],
+      );
       return { ok: true, error: null, id: Number(info.lastInsertRowid) };
     }
-    db.prepare("UPDATE testimonials SET name = ?, role = ?, body = ?, rating = ?, sort_order = ? WHERE id = ?")
-      .run(name, role, body, rating, so, args.id);
+    await db.run(
+      "UPDATE testimonials SET name = ?, role = ?, body = ?, rating = ?, sort_order = ? WHERE id = ?",
+      [name, role, body, rating, so, args.id],
+    );
     return { ok: true, error: null, id: args.id };
   },
 
-  deleteTestimonial(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR };
-    db.prepare("DELETE FROM testimonials WHERE id = ?").run(args.id);
+  async deleteTestimonial(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR };
+    await db.run("DELETE FROM testimonials WHERE id = ?", [args.id]);
     return { ok: true, error: null };
   },
 
-  saveFaq(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR, id: null };
+  async saveFaq(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR, id: null };
     const question = reqStr(args.question, 300);
     const answer = reqStr(args.answer, 2000);
     if (!question) return { ok: false, error: "Question is required.", id: null };
@@ -462,26 +476,38 @@ export const Actions = {
     const so = sortOrderOf(args.sortOrder);
     if (so === null) return { ok: false, error: "Sort order is out of range.", id: null };
     if (args.id === null || args.id === undefined) {
-      const info = db
-        .prepare("INSERT INTO faqs (question, answer, sort_order) VALUES (?, ?, ?)")
-        .run(question, answer, so);
+      const info = await db.run(
+        "INSERT INTO faqs (question, answer, sort_order) VALUES (?, ?, ?)",
+        [question, answer, so],
+      );
       return { ok: true, error: null, id: Number(info.lastInsertRowid) };
     }
-    db.prepare("UPDATE faqs SET question = ?, answer = ?, sort_order = ? WHERE id = ?")
-      .run(question, answer, so, args.id);
+    await db.run(
+      "UPDATE faqs SET question = ?, answer = ?, sort_order = ? WHERE id = ?",
+      [question, answer, so, args.id],
+    );
     return { ok: true, error: null, id: args.id };
   },
 
-  deleteFaq(args) {
-    if (!isAdmin(str(args.token, 500))) return { ok: false, error: SESSION_ERROR };
-    db.prepare("DELETE FROM faqs WHERE id = ?").run(args.id);
+  async deleteFaq(args) {
+    if (!(await isAdmin(str(args.token, 500)))) return { ok: false, error: SESSION_ERROR };
+    await db.run("DELETE FROM faqs WHERE id = ?", [args.id]);
     return { ok: true, error: null };
   },
 };
 
-// Seed on startup (no-op when data already exists).
-const seeded = seedIfEmpty();
-console.log(`[nextgen] data store: ${DATA_FILE} (seeded: ${seeded})`);
+// Whether this file is being run directly (`node server/server.mjs`)
+// as opposed to imported by the Vercel function.
+const isDirectRun =
+  process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+
+// Seed on startup when run directly (no-op when data already exists).
+// When imported (Vercel), initDb() is instead awaited lazily by the
+// function before its first dispatch — see api/actions.mjs.
+if (isDirectRun) {
+  const seeded = await initDb();
+  console.log(`[nextgen] data store: ${dbLocation} (seeded: ${seeded})`);
+}
 
 // ---------------------------------------------------------------------------
 // HTTP server: static dist/ + POST /actions
@@ -544,7 +570,7 @@ const server = createServer((req, res) => {
       if (size > 1_000_000) { req.destroy(); return; }
       chunks.push(chunk);
     });
-    req.on("end", () => {
+    req.on("end", async () => {
       let payload;
       try {
         payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
@@ -560,7 +586,7 @@ const server = createServer((req, res) => {
         return;
       }
       try {
-        sendJson(res, 200, handler(args));
+        sendJson(res, 200, await handler(args));
       } catch (err) {
         console.error(`[nextgen] action ${action} failed:`, err);
         sendJson(res, 500, { ok: false, error: "Internal error." });
@@ -584,7 +610,7 @@ const PORT = Number(process.env.PORT) || 3000;
 // Only listen when run directly (`node server/server.mjs`). The Vercel
 // serverless function (api/actions.mjs) imports { Actions } from this
 // module and must not start an HTTP server.
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isDirectRun) {
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[nextgen] listening on http://0.0.0.0:${PORT}`);
   });

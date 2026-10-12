@@ -1,18 +1,27 @@
 // Vercel serverless function for the NextGen Laptops site.
 //
 // The client POSTs { action, args } to /actions; vercel.json rewrites
-// that path to this function (/api/actions). The action handlers and the
-// SQLite store are shared with the long-running server
-// (server/server.mjs), which exports them without starting HTTP when
-// imported.
+// that path to this function (/api/actions). The action handlers are
+// shared with the long-running server (server/server.mjs), which
+// exports them without starting HTTP when imported.
 //
-// Storage on Vercel: server.mjs points DATA_FILE at /tmp when the VERCEL
-// env var is present, because the project filesystem is read-only. /tmp
-// is per-instance and ephemeral, so the shop data re-seeds on cold
-// starts and admin edits do NOT persist reliably on Vercel. For a
-// durable admin panel use the Render/Docker deployment (see README).
+// Storage: set TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) in the Vercel
+// project to use a hosted Turso (libSQL) database — that is what makes
+// shop data and admin edits durable on Vercel. Without those env vars
+// the store falls back to a SQLite file in /tmp (per-instance and
+// ephemeral: data re-seeds on cold starts). See the README's Turso
+// section.
 
-import { Actions } from "../server/server.mjs";
+import { Actions, initDb } from "../server/server.mjs";
+
+// Lazy, idempotent initialisation: create tables + seed on the first
+// request this instance serves, not at module load. initDb() itself
+// caches its promise, so concurrent first requests share one init.
+let ready;
+function ensureReady() {
+  ready ??= initDb();
+  return ready;
+}
 
 async function readPayload(req) {
   if (req.body && typeof req.body === "object") return req.body;
@@ -44,7 +53,8 @@ export default async function handler(req, res) {
     return;
   }
   try {
-    res.status(200).json(fn(args));
+    await ensureReady();
+    res.status(200).json(await fn(args));
   } catch (err) {
     console.error(`[nextgen] action ${action} failed:`, err);
     res.status(500).json({ ok: false, error: "Internal error." });

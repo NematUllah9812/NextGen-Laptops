@@ -16,7 +16,7 @@ on any normal host).
 
 ## Run locally
 
-Requires Node 22 or newer (the server uses the built-in `node:sqlite`).
+Requires Node 22 or newer.
 
 ```bash
 npm install
@@ -25,10 +25,13 @@ npm start            # http://localhost:3000
 ```
 
 `npm run dev` does build + start in one step. The server listens on
-`$PORT` (default 3000) and stores its data in `server/data/app.db`
-(override with the `DATA_FILE` env var). On first run the store is
-seeded automatically with the shop's current data; seeding only happens
-when the store is empty, so admin edits are never overwritten.
+`$PORT` (default 3000) and stores its data in a local SQLite file,
+`server/data/app.db` (override with the `DATA_FILE` env var), through
+the libSQL client in `server/db.mjs`. Local development needs **no
+environment variables and no database setup** — the file is created
+and seeded automatically on first run. Seeding only happens when the
+store is empty, so admin edits are never overwritten. To use a hosted
+Turso database instead of the file, see the Turso section below.
 
 ## Admin panel
 
@@ -49,6 +52,45 @@ Log in with the admin username and password configured on the server:
 Login sessions are random tokens stored server-side with a 7-day
 expiry; the browser keeps the token in localStorage.
 
+## Free durable database with Turso
+
+By default the site stores its data in a local SQLite file. On hosts
+without a durable disk (notably Vercel) that file is ephemeral, so
+admin edits would be lost on cold starts. The fix is a **free hosted
+Turso (libSQL) database** — Turso's free tier needs no credit card and
+is more than enough for this site. The server switches to it
+automatically when two environment variables are present; no code
+changes are needed.
+
+1. Create a free account at [turso.tech](https://turso.tech) (sign up
+   with GitHub or email — no card required).
+2. Create a database (dashboard **Create Database**, any name, e.g.
+   `nextgen-laptops`) — or with the Turso CLI: `turso db create nextgen-laptops`.
+3. Get the database URL (dashboard shows it as `libsql://…`, or
+   `turso db show nextgen-laptops --url`) and create an auth token
+   (dashboard **Create Token**, or `turso db tokens create nextgen-laptops`).
+4. Set both variables wherever the site runs:
+   - **Vercel:** Project → Settings → Environment Variables →
+     `TURSO_DATABASE_URL` = the `libsql://…` URL and
+     `TURSO_AUTH_TOKEN` = the token. Then **redeploy** (Deployments →
+     ⋯ → Redeploy) so the functions pick them up.
+   - **Render (optional):** the same two variables in the service's
+     Environment tab (`render.yaml` already declares them) — with
+     Turso set, you no longer need a persistent disk for the data.
+5. Done: on the next start the server creates the tables in Turso and
+   seeds the shop data if the database is empty. From then on, admin
+   edits, deals and login sessions are stored durably in Turso and
+   survive redeploys and cold starts on any host.
+
+Notes:
+
+- Never commit the token to git — it belongs only in the host's
+  environment-variable settings.
+- Local development does not need any of this: with the two variables
+  unset, the server uses the local file database as before.
+- To go back to the file database, just remove the two variables and
+  redeploy/restart.
+
 ## Deploy via git — Vercel (supported, with a storage caveat)
 
 This repo includes a `vercel.json` and an `api/actions.mjs` serverless
@@ -62,12 +104,13 @@ function, so a plain Vercel import of the repo works:
 3. Optionally set `ADMIN_USERNAME` / `ADMIN_PASSWORD` in the Vercel
    project's Environment Variables.
 
-**Caveat:** Vercel functions have no durable disk. The SQLite store
-lives in `/tmp`, so the site always displays correctly (it re-seeds
-with the shop's data on cold starts), but admin edits and login
-sessions can reset between cold starts and redeploys. If you need the
-admin panel's edits to stick permanently, deploy on Render instead
-(next section) with a persistent disk.
+**Caveat (only without Turso):** Vercel functions have no durable
+disk. If `TURSO_DATABASE_URL` is not set, the store falls back to a
+SQLite file in `/tmp`, so the site always displays correctly (it
+re-seeds with the shop's data on cold starts), but admin edits and
+login sessions can reset between cold starts and redeploys. Set up the
+free Turso database (previous section) to make Vercel fully durable —
+no host change needed.
 
 ## Deploy via git — Render (recommended)
 
@@ -117,7 +160,10 @@ index.html          app shell (copied to dist/ at build)
 build.mjs           esbuild (JS + .webp assets) + Tailwind CSS build
 client/src/         React client (Site, Admin, icons, theme.css, assets)
 server/server.mjs   static file server + POST /actions dispatcher
+server/db.mjs       libSQL facade — Turso when TURSO_DATABASE_URL is
+                    set, otherwise the local SQLite file
 server/seed.mjs     seed data + editable-settings allow-list
+api/actions.mjs     Vercel serverless function (same actions)
 dist/               built client (generated, git-ignored)
 server/data/        sqlite data file (generated, git-ignored)
 Dockerfile          node:22 multi-stage image, EXPOSE $PORT
